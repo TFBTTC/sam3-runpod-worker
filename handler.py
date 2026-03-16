@@ -1,6 +1,18 @@
 """
 RunPod Serverless Handler — SAM3 Floor Plan Segmentation
 
+SAM3 supporte les text prompts nativement (contrairement à SAM2).
+On passe directement le nom de la pièce ("séjour cuisine") → SAM3 segmente.
+La bbox GPT-4o est un hint optionnel, pas une nécessité.
+
+API officielle SAM3 (transformers):
+    inputs = processor(images=image, text="séjour", return_tensors="pt")
+    outputs = model(**inputs)
+    results = processor.post_process_instance_segmentation(
+        outputs, threshold=0.5, mask_threshold=0.5,
+        target_sizes=inputs["original_sizes"].tolist()
+    )
+
 Payload:
 {
     "image_b64": "<base64 PNG/JPEG>",
@@ -44,11 +56,7 @@ _model_class = None
 
 
 def load_sam3():
-    """Load SAM3 model and processor once at container startup.
-
-    Tries Sam3ForInstanceSegmentation first (has segmentation head),
-    falls back to Sam3Model (base) if not available.
-    """
+    """Load SAM3 model and processor once at container startup."""
     global _model, _processor, _model_class
 
     if _model is not None:
@@ -61,83 +69,98 @@ def load_sam3():
 
     from transformers import Sam3Processor
     _processor = Sam3Processor.from_pretrained(SAM3_MODEL_ID, **kwargs)
-    logger.info(f"Processor loaded: {type(_processor).__name__}")
+    logger.info(f"Processor: {type(_processor).__name__}")
 
-    # Try segmentation-head model first
-    try:
-        from transformers import Sam3ForInstanceSegmentation
-        _model = Sam3ForInstanceSegmentation.from_pretrained(SAM3_MODEL_ID, **kwargs)
-        _model_class = "Sam3ForInstanceSegmentation"
-        logger.info("Using Sam3ForInstanceSegmentation")
-    except (ImportError, Exception) as e:
-        logger.warning(f"Sam3ForInstanceSegmentation not available ({e}), falling back to Sam3Model")
-        from transformers import Sam3Model
-        _model = Sam3Model.from_pretrained(SAM3_MODEL_ID, **kwargs)
-        _model_class = "Sam3Model"
-        logger.info("Using Sam3Model")
+    # Sam3Model is the correct class per official docs
+    from transformers import Sam3Model
+    _model = Sam3Model.from_pretrained(SAM3_MODEL_ID, **kwargs)
+    _model_class = "Sam3Model"
 
     _model = _model.to(DEVICE).eval()
-    logger.info(f"SAM3 loaded in {time.time() - t0:.1f}s using {_model_class}")
+    logger.info(f"SAM3 loaded in {time.time() - t0:.1f}s")
     return _model, _processor
 
 
 def segment_rooms(model, processor, image: Image.Image, prompts: list) -> list:
     """Run SAM3 inference for each room prompt."""
-    h, w = image.size[1], image.size[0]
     results = []
-
     for prompt in prompts:
         text = prompt.get("text", "room")
-        box = prompt.get("box")     # [x1, y1, x2, y2]
-        point = prompt.get("point") # [cx, cy]
-
-        mask, score = _segment_one(model, processor, image, text, box, point, h, w)
+        box = prompt.get("box")     # [x1, y1, x2, y2] — optional spatial hint
+        point = prompt.get("point") # [cx, cy] — optional fallback
+        mask, score = _segment_one(model, processor, image, text, box, point)
         results.append({"id": prompt["id"], "mask": mask, "score": score})
-
     return results
 
 
-def _segment_one(model, processor, image, text, box, point, h, w):
+def _segment_one(model, processor, image, text, box, point):
     """
-    Segment one room. Attempt order:
-    1. Text + box  (SAM3 native — best quality)
-    2. Point + box (spatial only — fallback)
-    3. Box only    (last resort)
+    Segment one room.
+
+    Attempt order:
+    1. Text only      — SAM3 native: understands "séjour cuisine" semantically
+    2. Text + box     — text + spatial hint from GPT-4o bbox
+    3. Point + box    — pure spatial fallback
     """
-    # ── Attempt 1: text + box ────────────────────────────────────────────────
-    try:
-        kwargs = {"images": image, "return_tensors": "pt"}
+    h, w = image.size[1], image.size[0]
 
-        # SAM3: text as list of concepts
-        if text:
-            kwargs["text"] = [text]
+    # ── Attempt 1: text prompt only (SAM3 core feature) ────────────────────
+    # Official API: text is a plain string, not a list
+    # target_sizes comes from inputs["original_sizes"], not manually from (h,w)
+    if text:
+        try:
+            inputs = processor(images=image, text=text, return_tensors="pt")
+            inputs = inputs.to(DEVICE)
 
-        if box:
-            kwargs["input_boxes"] = [[[box]]]
+            if not hasattr(_segment_one, "_input_logged"):
+                logger.info(f"Input keys: {list(inputs.keys())}")
+                _segment_one._input_logged = True
 
-        inputs = processor(**kwargs)
-        inputs = {k: v.to(DEVICE) if hasattr(v, "to") else v for k, v in inputs.items()}
+            with torch.inference_mode():
+                outputs = model(**inputs)
 
-        if not hasattr(_segment_one, "_logged"):
-            logger.info(f"Input keys: {list(inputs.keys())}")
-            _segment_one._logged = True
+            if not hasattr(_segment_one, "_output_logged"):
+                logger.info(f"Output type: {type(outputs).__name__}")
+                logger.info(f"Output attrs: {[k for k in dir(outputs) if not k.startswith('_')][:20]}")
+                _segment_one._output_logged = True
 
-        with torch.inference_mode():
-            outputs = model(**inputs)
+            orig_sizes = inputs.get("original_sizes")
+            target_sizes = orig_sizes.tolist() if orig_sizes is not None else [(h, w)]
 
-        if not hasattr(_segment_one, "_out_logged"):
-            out_keys = [k for k in dir(outputs) if not k.startswith("_") and not callable(getattr(outputs, k, None))]
-            logger.info(f"Output attrs: {out_keys[:15]}")
-            _segment_one._out_logged = True
+            mask, score = _extract_mask(outputs, processor, target_sizes, h, w, threshold=0.4)
+            if mask is not None and mask.sum() > 0:
+                logger.info(f"[text] '{text}' → score={score:.3f}, pixels={mask.sum()}")
+                return mask, score
 
-        mask, score = _extract_best_mask(outputs, processor, h, w, threshold=0.4)
-        if mask is not None and mask.sum() > 0:
-            return mask, score
+        except Exception as e:
+            logger.warning(f"Text-only failed for '{text}': {e}")
 
-    except Exception as e:
-        logger.warning(f"Text+box attempt failed: {e}")
+    # ── Attempt 2: text + bbox hint ───────────────────────────────────────────
+    if text and box:
+        try:
+            inputs = processor(
+                images=image,
+                text=text,
+                input_boxes=[[[box]]],
+                return_tensors="pt",
+            )
+            inputs = inputs.to(DEVICE)
 
-    # ── Attempt 2: point + box ───────────────────────────────────────────────
+            with torch.inference_mode():
+                outputs = model(**inputs)
+
+            orig_sizes = inputs.get("original_sizes")
+            target_sizes = orig_sizes.tolist() if orig_sizes is not None else [(h, w)]
+
+            mask, score = _extract_mask(outputs, processor, target_sizes, h, w, threshold=0.3)
+            if mask is not None and mask.sum() > 0:
+                logger.info(f"[text+box] '{text}' → score={score:.3f}")
+                return mask, score
+
+        except Exception as e:
+            logger.warning(f"Text+box failed for '{text}': {e}")
+
+    # ── Attempt 3: point + box (pure spatial) ────────────────────────────
     if point is not None:
         try:
             kwargs = {
@@ -150,113 +173,72 @@ def _segment_one(model, processor, image, text, box, point, h, w):
                 kwargs["input_boxes"] = [[[box]]]
 
             inputs = processor(**kwargs)
-            inputs = {k: v.to(DEVICE) if hasattr(v, "to") else v for k, v in inputs.items()}
+            inputs = inputs.to(DEVICE)
 
             with torch.inference_mode():
                 outputs = model(**inputs)
 
-            mask, score = _extract_best_mask(outputs, processor, h, w, threshold=0.3)
+            orig_sizes = inputs.get("original_sizes")
+            target_sizes = orig_sizes.tolist() if orig_sizes is not None else [(h, w)]
+
+            mask, score = _extract_mask(outputs, processor, target_sizes, h, w, threshold=0.3)
             if mask is not None and mask.sum() > 0:
+                logger.info(f"[point] '{text}' → score={score:.3f}")
                 return mask, score
 
         except Exception as e:
-            logger.warning(f"Point+box attempt failed: {e}")
+            logger.warning(f"Point fallback failed for '{text}': {e}")
 
-    # ── Attempt 3: box only ──────────────────────────────────────────────────
-    if box is not None:
-        try:
-            kwargs = {
-                "images": image,
-                "input_boxes": [[[box]]],
-                "return_tensors": "pt",
-            }
-            inputs = processor(**kwargs)
-            inputs = {k: v.to(DEVICE) if hasattr(v, "to") else v for k, v in inputs.items()}
-
-            with torch.inference_mode():
-                outputs = model(**inputs)
-
-            mask, score = _extract_best_mask(outputs, processor, h, w, threshold=0.2)
-            if mask is not None and mask.sum() > 0:
-                return mask, score
-
-        except Exception as e:
-            logger.warning(f"Box-only attempt failed: {e}")
-
-    logger.warning(f"All attempts failed for prompt '{text}' — returning empty mask")
+    logger.warning(f"All attempts failed for '{text}'")
     return np.zeros((h, w), dtype=np.uint8), 0.0
 
 
-def _extract_best_mask(outputs, processor, h, w, threshold=0.4):
+def _extract_mask(outputs, processor, target_sizes, h, w, threshold=0.4):
     """
-    Extract best mask from model outputs.
-    Tries multiple strategies depending on what the model returns.
+    Extract best mask from SAM3 outputs.
+    Tries post_process_instance_segmentation first (official API),
+    then falls back to raw pred_masks interpolation.
     """
-    # ── Strategy A: post_process_instance_segmentation ───────────────────────
+    # ── Official API: post_process_instance_segmentation ────────────────────
     try:
         post = processor.post_process_instance_segmentation(
             outputs,
             threshold=threshold,
             mask_threshold=0.5,
-            target_sizes=[(h, w)],
+            target_sizes=target_sizes,
         )
         if post and post[0].get("masks") is not None and len(post[0]["masks"]) > 0:
             masks = post[0]["masks"]
             scores = post[0].get("scores")
-            best_idx = int(torch.argmax(scores).item()) if (scores is not None and len(scores) > 0) else 0
-            score = float(scores[best_idx]) if scores is not None else 0.7
-            mask = masks[best_idx].cpu().numpy().astype(np.uint8) * 255
+            best = int(torch.argmax(scores).item()) if (scores is not None and len(scores) > 0) else 0
+            score = float(scores[best]) if scores is not None else 0.7
+            mask = masks[best].cpu().numpy().astype(np.uint8) * 255
             if mask.sum() > 0:
-                logger.info(f"Mask via post_process_instance_segmentation, score={score:.3f}")
                 return mask, score
     except Exception as e:
-        logger.debug(f"post_process_instance_segmentation failed: {e}")
+        logger.debug(f"post_process_instance_segmentation: {e}")
 
-    # ── Strategy B: raw pred_masks interpolation ──────────────────────────────
+    # ── Fallback: raw pred_masks upsampled ───────────────────────────────────
     try:
         if hasattr(outputs, "pred_masks"):
-            pred_masks = outputs.pred_masks
-            iou_scores = getattr(outputs, "iou_scores", None)
-            logger.info(f"pred_masks shape: {pred_masks.shape}, iou_scores: {iou_scores.shape if iou_scores is not None else None}")
-
-            # (batch, num_masks, H_low, W_low) → take batch 0
-            m = pred_masks[0]  # (num_masks, H, W) or (1, num_masks, H, W)
+            pm = outputs.pred_masks  # (B, N, H_low, W_low)
+            iou = getattr(outputs, "iou_scores", None)
+            m = pm[0]  # (N, H_low, W_low)
             if m.dim() == 3:
-                masks_up = torch.nn.functional.interpolate(
+                up = torch.nn.functional.interpolate(
                     m.unsqueeze(0).float(), size=(h, w), mode="bilinear", align_corners=False
-                ).squeeze(0)  # (num_masks, H, W)
-                binary = (masks_up > 0).cpu().numpy().astype(np.uint8) * 255
-
-                if iou_scores is not None:
-                    sc = iou_scores[0].squeeze().cpu().numpy()
-                    sc = np.atleast_1d(sc)
-                    best_idx = int(np.argmax(sc))
-                    score = float(sc[best_idx])
+                ).squeeze(0)
+                binary = (up > 0).cpu().numpy().astype(np.uint8) * 255
+                if iou is not None:
+                    sc = np.atleast_1d(iou[0].squeeze().cpu().numpy())
+                    best = int(np.argmax(sc))
+                    score = float(sc[best])
                 else:
-                    best_idx, score = 0, 0.7
-
-                if binary[best_idx].sum() > 0:
-                    logger.info(f"Mask via pred_masks interpolation, score={score:.3f}")
-                    return binary[best_idx], score
+                    best, score = 0, 0.7
+                if binary[best].sum() > 0:
+                    return binary[best], score
     except Exception as e:
-        logger.debug(f"pred_masks strategy failed: {e}")
-
-    # ── Strategy C: post_process_masks (SAM2 API) ─────────────────────────────
-    try:
-        if hasattr(processor, "post_process_masks") and hasattr(outputs, "pred_masks"):
-            masks = processor.post_process_masks(
-                outputs.pred_masks, [(h, w)], [(h, w)]
-            )
-            if masks and len(masks[0]) > 0:
-                m = masks[0][0]
-                if m.dim() == 3:
-                    m = m[0]
-                binary = m.cpu().numpy().astype(np.uint8) * 255
-                if binary.sum() > 0:
-                    logger.info("Mask via post_process_masks")
-                    return binary, 0.7
-    except Exception as e:
-        logger.debug(f"post_process_masks strategy failed: {e}")
+        logger.debug(f"pred_masks fallback: {e}")
 
     return None, 0.0
 
@@ -319,7 +301,7 @@ def handler(job: dict) -> dict:
     ]
 
     elapsed = round(time.time() - t0, 2)
-    logger.info(f"Done: {len(prompts)} rooms in {elapsed}s | model: {_model_class}")
+    logger.info(f"Done: {len(prompts)} rooms in {elapsed}s")
 
     return {"masks": output_masks, "model_used": "sam3", "processing_time_s": elapsed}
 
