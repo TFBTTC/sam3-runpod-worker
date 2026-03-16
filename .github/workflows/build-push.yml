@@ -49,25 +49,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Create/Update RunPod endpoint
-        if: success()
-        env:
-          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
-          IMAGE: ghcr.io/${{ github.repository }}:latest
+      - name: Done
         run: |
-          echo "Image built: $IMAGE"
-          # Create or update RunPod template
-          TEMPLATE_RESULT=$(curl -s -X POST \
-            "https://api.runpod.io/graphql?api_key=$RUNPOD_API_KEY" \
-            -H "Content-Type: application/json" \
-            -d "{\"query\": \"mutation { saveTemplate(input: { containerDiskInGb: 30, imageName: \\\"$IMAGE\\\", isPublic: false, isServerless: true, name: \\\"sam3-floor-plan\\\", env: [{key: \\\"SAM3_MODEL_ID\\\", value: \\\"facebook/sam3\\\"}] }) { id name } }\"}"
-          )
-          echo "Template result: $TEMPLATE_RESULT"
-          TEMPLATE_ID=$(echo $TEMPLATE_RESULT | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-          echo "Template ID: $TEMPLATE_ID"
-          echo "TEMPLATE_ID=$TEMPLATE_ID" >> $GITHUB_ENV
-
-      - name: Output image URL
-        run: |
-          echo "✅ Docker image: ghcr.io/${{ github.repository }}:latest"
-          echo "Add RUNPOD_API_KEY to repo secrets to auto-create RunPod endpoint"
+          echo "Image pushed: ghcr.io/${{ github.repository }}:latest"
+          echo "RunPod endpoint mqpq1hn0bcg8a2 will use this image on next worker start"
