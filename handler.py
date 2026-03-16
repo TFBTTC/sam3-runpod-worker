@@ -1,35 +1,36 @@
 """
-RunPod Serverless Handler — SAM3 Floor Plan Segmentation
+RunPod Serverless Handler — SAM3 Floor Plan Room Segmentation
 arXiv:2511.16719 | transformers >= 4.45 | facebook/sam3
 
-Stratégie hybride basée sur les capacités réelles de SAM3 sur plans d'architecte :
+Objectif : segmenter les ESPACES des pièces d'un plan d'appartement.
 
-SAM3 PCS (text prompt) fonctionne sur les pièces avec équipements dessinés :
-  - wc, toilet, bathroom, laundry room → très bons scores (0.7–0.93)
-  - bedroom, living room, kitchen → scores nuls (rectangles vides sur le plan)
+Flux :
+  GPT-4o identifie les pièces et leur centre → SAM3 segmente l'espace à ce point.
 
-Pour les pièces sans fixtures, on utilise SAM3 en mode point prompt :
-  - GPT-4o fournit le centre de la pièce
-  - SAM3 segmente "ce qui se trouve à ce point"
+SAM3 avec prompt POINT segmente la région fermée autour du point donné.
+Les murs (lignes épaisses sombres) constituent des frontières naturelles pour SAM3.
+C'est exactement le cas d'usage prévu par SAM3 : "segment what is at this point".
 
 Payload:
 {
-    "image_b64": "<base64>",
+    "image_b64": "<base64 PNG/JPEG>",
     "rooms": [
         {
             "id": 1,
-            "type_en": "bathroom",        # label anglais pour SAM3 text
-            "type_fr": "salle de bain",   # label français pour affichage
-            "point": [cx, cy],            # centre en pixels (de GPT-4o)
-            "box":   [x1, y1, x2, y2]    # bbox en pixels (de GPT-4o, optionnel)
+            "type": "chambre",       # label pour le rendu (French)
+            "point": [cx, cy],       # centre en pixels — fourni par GPT-4o
+            "box":   [x1,y1,x2,y2]  # bbox en pixels — optionnel, améliore la précision
         }
     ]
 }
 
 Response:
 {
-    "masks": [{"id": 1, "mask_rle": {...}, "score": 0.91, "method": "text_pcs"}],
-    "model_used": "sam3"
+    "masks": [
+        {"id": 1, "mask_rle": {"rle":[...], "shape":[h,w], "starts_with":0}, "score": 0.88}
+    ],
+    "model_used": "sam3",
+    "processing_time_s": 3.2
 }
 """
 import base64
@@ -72,99 +73,35 @@ def load_sam3():
     return _model, _processor
 
 
-# ─── Concepts with distinctive visual features on floor plans ─────────────────
-# These reliably work with SAM3 text prompts (confirmed on architectural drawings)
-TEXT_PROMPT_TYPES = {
-    "wc", "toilet", "bathroom", "bath", "shower room",
-    "laundry room", "laundry", "utility room",
-    "garage", "carport",
-}
-
-
 def segment_room(model, processor, image: Image.Image, room: dict) -> dict:
     """
-    Segment one room using the best available strategy:
-    1. SAM3 text prompt  — for rooms with distinctive fixtures (wc, bathroom…)
-    2. SAM3 point prompt — for plain rooms (bedroom, living room, kitchen…)
+    Segment the closed space of one room using SAM3 point prompt.
+
+    SAM3 receives the center point (from GPT-4o) and segments the enclosed
+    region at that location — bounded naturally by the wall lines.
     """
     h, w = image.size[1], image.size[0]
     rid = room["id"]
-    type_en = room.get("type_en", room.get("text", "room")).lower().strip()
     point = room.get("point")   # [cx, cy] in pixels
-    box = room.get("box")       # [x1, y1, x2, y2] in pixels
+    box = room.get("box")       # [x1, y1, x2, y2] in pixels — optional
 
-    # ── Strategy 1: SAM3 text PCS for fixture-bearing rooms ───────────────────
-    if type_en in TEXT_PROMPT_TYPES:
-        mask, score = _text_prompt(model, processor, image, type_en, h, w)
-        if mask is not None and mask.sum() > 0:
-            logger.info(f"[text] id={rid} '{type_en}' score={score:.3f} px={mask.sum()}")
-            return {"id": rid, "mask": mask, "score": score, "method": "text_pcs"}
+    if point is None:
+        logger.warning(f"Room id={rid} has no point — skipping")
+        return {"id": rid, "mask": np.zeros((h, w), dtype=np.uint8), "score": 0.0}
 
-    # ── Strategy 2: SAM3 point prompt (GPT-4o center) ─────────────────────────
-    if point is not None:
-        mask, score = _point_prompt(model, processor, image, point, box, h, w)
-        if mask is not None and mask.sum() > 0:
-            logger.info(f"[point] id={rid} '{type_en}' score={score:.3f} px={mask.sum()}")
-            return {"id": rid, "mask": mask, "score": score, "method": "point"}
-
-    # ── Strategy 3: text prompt regardless of type (last attempt) ─────────────
-    if type_en not in TEXT_PROMPT_TYPES:
-        mask, score = _text_prompt(model, processor, image, type_en, h, w)
-        if mask is not None and mask.sum() > 0:
-            logger.info(f"[text_fallback] id={rid} '{type_en}' score={score:.3f}")
-            return {"id": rid, "mask": mask, "score": score, "method": "text_fallback"}
-
-    logger.warning(f"All SAM3 strategies failed for id={rid} '{type_en}'")
-    return {"id": rid, "mask": np.zeros((h, w), dtype=np.uint8), "score": 0.0, "method": "failed"}
-
-
-def _text_prompt(model, processor, image, text, h, w):
-    """SAM3 text PCS — official API."""
-    try:
-        inputs = processor(images=image, text=text, return_tensors="pt").to(DEVICE)
-
-        with torch.inference_mode():
-            outputs = model(**inputs)
-
-        orig_sizes = inputs.get("original_sizes")
-        target_sizes = orig_sizes.tolist() if orig_sizes is not None else [(h, w)]
-
-        result = processor.post_process_instance_segmentation(
-            outputs, threshold=0.35, mask_threshold=0.5, target_sizes=target_sizes
-        )[0]
-
-        masks = result.get("masks", [])
-        scores = result.get("scores", [])
-
-        if len(masks) == 0:
-            return None, 0.0
-
-        # Take highest-scoring mask
-        if len(scores) > 0:
-            best = int(torch.argmax(torch.tensor(scores)).item()) if isinstance(scores, list) else int(torch.argmax(scores).item())
-            score = float(scores[best]) if isinstance(scores, list) else float(scores[best])
-        else:
-            best, score = 0, 0.7
-
-        mask = masks[best].cpu().numpy().astype(np.uint8) * 255
-        return (mask, score) if mask.sum() > 0 else (None, 0.0)
-
-    except Exception as e:
-        logger.debug(f"_text_prompt '{text}': {e}")
-        return None, 0.0
-
-
-def _point_prompt(model, processor, image, point, box, h, w):
-    """SAM3 point prompt with optional box hint."""
+    # ── SAM3 point prompt ─────────────────────────────────────────────────────
+    # input_points: [[[cx, cy]]] — batch=1, num_points=1, coords=2
+    # input_labels: [[[1]]]     — 1 = foreground point (segment this)
     try:
         kwargs = {
             "images": image,
-            "input_points": [[[[point[0], point[1]]]]],
+            "input_points": [[[[float(point[0]), float(point[1])]]]],
             "input_labels": [[[1]]],
             "return_tensors": "pt",
         }
         if box:
-            kwargs["input_boxes"] = [[[box]]]
+            # Box hint improves precision when available
+            kwargs["input_boxes"] = [[[ [float(b) for b in box] ]]]
 
         inputs = processor(**kwargs).to(DEVICE)
 
@@ -175,54 +112,59 @@ def _point_prompt(model, processor, image, point, box, h, w):
         target_sizes = orig_sizes.tolist() if orig_sizes is not None else [(h, w)]
 
         result = processor.post_process_instance_segmentation(
-            outputs, threshold=0.3, mask_threshold=0.5, target_sizes=target_sizes
+            outputs,
+            threshold=0.3,
+            mask_threshold=0.5,
+            target_sizes=target_sizes,
         )[0]
 
-        masks = result.get("masks", [])
+        masks  = result.get("masks",  [])
         scores = result.get("scores", [])
 
-        if len(masks) == 0:
-            # Fallback: raw pred_masks
-            return _raw_pred_masks(outputs, h, w)
+        if len(masks) > 0:
+            # Best scoring mask
+            if isinstance(scores, torch.Tensor) and len(scores) > 0:
+                best = int(torch.argmax(scores).item())
+                score = float(scores[best])
+            elif isinstance(scores, list) and len(scores) > 0:
+                best = int(np.argmax(scores))
+                score = float(scores[best])
+            else:
+                best, score = 0, 0.7
 
-        best = 0
-        score = 0.7
-        if len(scores) > 0:
-            s = scores if isinstance(scores, torch.Tensor) else torch.tensor(scores)
-            best = int(torch.argmax(s).item())
-            score = float(s[best])
+            mask = masks[best].cpu().numpy().astype(np.uint8) * 255
 
-        mask = masks[best].cpu().numpy().astype(np.uint8) * 255
-        return (mask, score) if mask.sum() > 0 else _raw_pred_masks(outputs, h, w)
+            if mask.sum() > 0:
+                logger.info(f"id={rid} '{room.get('type','')}' → {mask.sum()} px, score={score:.3f}")
+                return {"id": rid, "mask": mask, "score": score}
+
+        # ── Fallback: raw pred_masks upsampled ────────────────────────────────
+        if hasattr(outputs, "pred_masks"):
+            pm = outputs.pred_masks[0]  # (N, H_low, W_low)
+            if pm.dim() == 3 and pm.shape[0] > 0:
+                up = torch.nn.functional.interpolate(
+                    pm.unsqueeze(0).float(), size=(h, w),
+                    mode="bilinear", align_corners=False
+                ).squeeze(0)
+                binary = (up > 0).cpu().numpy().astype(np.uint8) * 255
+
+                iou = getattr(outputs, "iou_scores", None)
+                if iou is not None:
+                    sc = np.atleast_1d(iou[0].squeeze().cpu().numpy())
+                    best = int(np.argmax(sc))
+                    score = float(sc[best])
+                else:
+                    best, score = 0, 0.65
+
+                if binary[best].sum() > 0:
+                    logger.info(f"id={rid} '{room.get('type','')}' via pred_masks → {binary[best].sum()} px")
+                    return {"id": rid, "mask": binary[best], "score": score}
 
     except Exception as e:
-        logger.debug(f"_point_prompt: {e}")
-        return None, 0.0
+        logger.error(f"SAM3 failed for id={rid}: {e}", exc_info=True)
 
-
-def _raw_pred_masks(outputs, h, w):
-    """Last resort: upsample raw pred_masks tensor."""
-    try:
-        if not hasattr(outputs, "pred_masks"):
-            return None, 0.0
-        pm = outputs.pred_masks[0]  # (N, H_low, W_low)
-        if pm.dim() != 3:
-            return None, 0.0
-        up = torch.nn.functional.interpolate(
-            pm.unsqueeze(0).float(), size=(h, w), mode="bilinear", align_corners=False
-        ).squeeze(0)
-        binary = (up > 0).cpu().numpy().astype(np.uint8) * 255
-        iou = getattr(outputs, "iou_scores", None)
-        if iou is not None:
-            sc = np.atleast_1d(iou[0].squeeze().cpu().numpy())
-            best = int(np.argmax(sc))
-            score = float(sc[best])
-        else:
-            best, score = 0, 0.6
-        return (binary[best], score) if binary[best].sum() > 0 else (None, 0.0)
-    except Exception as e:
-        logger.debug(f"_raw_pred_masks: {e}")
-        return None, 0.0
+    logger.warning(f"id={rid} '{room.get('type','')}' — no mask produced")
+    return {"id": rid, "mask": np.zeros((h, w), dtype=np.uint8), "score": 0.0}
 
 
 def encode_rle(mask: np.ndarray) -> dict:
@@ -262,22 +204,19 @@ def handler(job: dict) -> dict:
     except Exception as e:
         return {"error": f"Model load failed: {e}"}
 
-    # Support "rooms" (new), "concepts" (v2), "prompts" (legacy)
-    rooms = job_input.get("rooms")
+    # Accept "rooms" (canonical) or "prompts" (legacy compat)
+    rooms = job_input.get("rooms") or [
+        {
+            "id": p.get("id", i+1),
+            "type": p.get("type", p.get("text", "room")),
+            "point": p.get("point"),
+            "box": p.get("box"),
+        }
+        for i, p in enumerate(job_input.get("prompts", []))
+    ]
+
     if not rooms:
-        # Convert concepts or prompts to rooms format
-        concepts = job_input.get("concepts") or job_input.get("prompts", [])
-        if not concepts:
-            return {"error": "No rooms, concepts, or prompts provided"}
-        rooms = []
-        for i, c in enumerate(concepts):
-            rooms.append({
-                "id": c.get("id", i+1),
-                "type_en": c.get("type_en") or c.get("text") or c.get("type") or "room",
-                "type_fr": c.get("type_fr", ""),
-                "point": c.get("point"),
-                "box": c.get("box"),
-            })
+        return {"error": "No rooms provided. Send rooms=[{id, type, point:[cx,cy], box:[x1,y1,x2,y2]}]"}
 
     results = []
     for room in rooms:
@@ -286,17 +225,15 @@ def handler(job: dict) -> dict:
             "id": res["id"],
             "mask_rle": encode_rle(res["mask"]),
             "score": round(res["score"], 4),
-            "method": res["method"],
         })
 
     elapsed = round(time.time() - t0, 2)
     good = sum(1 for r in results if r["score"] > 0)
-    logger.info(f"Done: {len(rooms)} rooms, {good} segmented in {elapsed}s")
+    logger.info(f"Done: {len(rooms)} rooms → {good} segmented in {elapsed}s")
 
     return {"masks": results, "model_used": "sam3", "processing_time_s": elapsed}
 
 
 if __name__ == "__main__":
     load_sam3()
-    logger.info("SAM3 ready.")
     runpod.serverless.start({"handler": handler})
