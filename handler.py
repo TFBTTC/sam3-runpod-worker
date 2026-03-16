@@ -1,31 +1,53 @@
 """
 RunPod Serverless Handler — SAM3 Floor Plan Segmentation
 
-SAM3 supporte les text prompts nativement (contrairement à SAM2).
-On passe directement le nom de la pièce ("séjour cuisine") → SAM3 segmente.
-La bbox GPT-4o est un hint optionnel, pas une nécessité.
+Architecture conforme aux recommandations officielles SAM3 :
 
-API officielle SAM3 (transformers):
-    inputs = processor(images=image, text="séjour", return_tensors="pt")
-    outputs = model(**inputs)
-    results = processor.post_process_instance_segmentation(
-        outputs, threshold=0.5, mask_threshold=0.5,
-        target_sizes=inputs["original_sizes"].tolist()
-    )
+SAM3 fait du Promptable Concept Segmentation (PCS) :
+- text="chambre" → segmente TOUTES les chambres en une passe
+- text="séjour" → segmente le séjour
+- text="cuisine" → segmente la cuisine
+- etc.
+
+On envoie donc UN prompt par TYPE de pièce (pas par instance),
+et SAM3 retourne autant de masques qu'il y a d'instances de ce concept.
 
 Payload:
 {
     "image_b64": "<base64 PNG/JPEG>",
-    "prompts": [
-        {"id": 1, "text": "séjour cuisine", "box": [x1,y1,x2,y2], "point": [cx,cy]}
+    "concepts": [
+        {"type": "chambre", "text": "chambre"},
+        {"type": "séjour",  "text": "séjour"},
+        {"type": "cuisine", "text": "cuisine"}
     ]
 }
 
 Response:
 {
-    "masks": [{"id": 1, "mask_rle": {...}, "score": 0.95}],
+    "segments": [
+        {
+            "type": "chambre",
+            "instances": [
+                {"mask_rle": {...}, "score": 0.91, "box": [x1,y1,x2,y2]},
+                {"mask_rle": {...}, "score": 0.87, "box": [x1,y1,x2,y2]}
+            ]
+        }
+    ],
     "model_used": "sam3"
 }
+
+API officielle SAM3 (transformers >= 4.45, arXiv:2511.16719) :
+    inputs = processor(images=image, text="chambre", return_tensors="pt")
+    outputs = model(**inputs)
+    results = processor.post_process_instance_segmentation(
+        outputs,
+        threshold=0.5,
+        mask_threshold=0.5,
+        target_sizes=inputs["original_sizes"].tolist()
+    )[0]
+    # results["masks"]  → tous les masques du concept
+    # results["boxes"]  → leurs bounding boxes
+    # results["scores"] → scores de confiance
 """
 import base64
 import io
@@ -52,12 +74,11 @@ HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("RUNPOD_SECRET_HF_TOKEN")
 
 _model = None
 _processor = None
-_model_class = None
 
 
 def load_sam3():
     """Load SAM3 model and processor once at container startup."""
-    global _model, _processor, _model_class
+    global _model, _processor
 
     if _model is not None:
         return _model, _processor
@@ -67,180 +88,73 @@ def load_sam3():
 
     kwargs = {"token": HF_TOKEN} if HF_TOKEN else {}
 
-    from transformers import Sam3Processor
+    from transformers import Sam3Processor, Sam3Model
+
     _processor = Sam3Processor.from_pretrained(SAM3_MODEL_ID, **kwargs)
-    logger.info(f"Processor: {type(_processor).__name__}")
-
-    # Sam3Model is the correct class per official docs
-    from transformers import Sam3Model
     _model = Sam3Model.from_pretrained(SAM3_MODEL_ID, **kwargs)
-    _model_class = "Sam3Model"
-
     _model = _model.to(DEVICE).eval()
-    logger.info(f"SAM3 loaded in {time.time() - t0:.1f}s")
+
+    logger.info(f"SAM3 loaded in {time.time() - t0:.1f}s | {_model.__class__.__name__}")
     return _model, _processor
 
 
-def segment_rooms(model, processor, image: Image.Image, prompts: list) -> list:
-    """Run SAM3 inference for each room prompt."""
-    results = []
-    for prompt in prompts:
-        text = prompt.get("text", "room")
-        box = prompt.get("box")     # [x1, y1, x2, y2] — optional spatial hint
-        point = prompt.get("point") # [cx, cy] — optional fallback
-        mask, score = _segment_one(model, processor, image, text, box, point)
-        results.append({"id": prompt["id"], "mask": mask, "score": score})
-    return results
-
-
-def _segment_one(model, processor, image, text, box, point):
+def segment_concept(model, processor, image: Image.Image, text: str) -> list:
     """
-    Segment one room.
+    Segment ALL instances of a concept in the image using SAM3 PCS.
 
-    Attempt order:
-    1. Text only      — SAM3 native: understands "séjour cuisine" semantically
-    2. Text + box     — text + spatial hint from GPT-4o bbox
-    3. Point + box    — pure spatial fallback
+    SAM3's Promptable Concept Segmentation finds every occurrence of
+    the concept in one forward pass — e.g. text="chambre" returns masks
+    for ALL bedrooms simultaneously.
+
+    Returns list of {mask, score, box} for each detected instance.
     """
     h, w = image.size[1], image.size[0]
 
-    # ── Attempt 1: text prompt only (SAM3 core feature) ────────────────────
-    # Official API: text is a plain string, not a list
-    # target_sizes comes from inputs["original_sizes"], not manually from (h,w)
-    if text:
-        try:
-            inputs = processor(images=image, text=text, return_tensors="pt")
-            inputs = inputs.to(DEVICE)
-
-            if not hasattr(_segment_one, "_input_logged"):
-                logger.info(f"Input keys: {list(inputs.keys())}")
-                _segment_one._input_logged = True
-
-            with torch.inference_mode():
-                outputs = model(**inputs)
-
-            if not hasattr(_segment_one, "_output_logged"):
-                logger.info(f"Output type: {type(outputs).__name__}")
-                logger.info(f"Output attrs: {[k for k in dir(outputs) if not k.startswith('_')][:20]}")
-                _segment_one._output_logged = True
-
-            orig_sizes = inputs.get("original_sizes")
-            target_sizes = orig_sizes.tolist() if orig_sizes is not None else [(h, w)]
-
-            mask, score = _extract_mask(outputs, processor, target_sizes, h, w, threshold=0.4)
-            if mask is not None and mask.sum() > 0:
-                logger.info(f"[text] '{text}' → score={score:.3f}, pixels={mask.sum()}")
-                return mask, score
-
-        except Exception as e:
-            logger.warning(f"Text-only failed for '{text}': {e}")
-
-    # ── Attempt 2: text + bbox hint ───────────────────────────────────────────
-    if text and box:
-        try:
-            inputs = processor(
-                images=image,
-                text=text,
-                input_boxes=[[[box]]],
-                return_tensors="pt",
-            )
-            inputs = inputs.to(DEVICE)
-
-            with torch.inference_mode():
-                outputs = model(**inputs)
-
-            orig_sizes = inputs.get("original_sizes")
-            target_sizes = orig_sizes.tolist() if orig_sizes is not None else [(h, w)]
-
-            mask, score = _extract_mask(outputs, processor, target_sizes, h, w, threshold=0.3)
-            if mask is not None and mask.sum() > 0:
-                logger.info(f"[text+box] '{text}' → score={score:.3f}")
-                return mask, score
-
-        except Exception as e:
-            logger.warning(f"Text+box failed for '{text}': {e}")
-
-    # ── Attempt 3: point + box (pure spatial) ────────────────────────────
-    if point is not None:
-        try:
-            kwargs = {
-                "images": image,
-                "input_points": [[[[point[0], point[1]]]]],
-                "input_labels": [[[1]]],
-                "return_tensors": "pt",
-            }
-            if box:
-                kwargs["input_boxes"] = [[[box]]]
-
-            inputs = processor(**kwargs)
-            inputs = inputs.to(DEVICE)
-
-            with torch.inference_mode():
-                outputs = model(**inputs)
-
-            orig_sizes = inputs.get("original_sizes")
-            target_sizes = orig_sizes.tolist() if orig_sizes is not None else [(h, w)]
-
-            mask, score = _extract_mask(outputs, processor, target_sizes, h, w, threshold=0.3)
-            if mask is not None and mask.sum() > 0:
-                logger.info(f"[point] '{text}' → score={score:.3f}")
-                return mask, score
-
-        except Exception as e:
-            logger.warning(f"Point fallback failed for '{text}': {e}")
-
-    logger.warning(f"All attempts failed for '{text}'")
-    return np.zeros((h, w), dtype=np.uint8), 0.0
-
-
-def _extract_mask(outputs, processor, target_sizes, h, w, threshold=0.4):
-    """
-    Extract best mask from SAM3 outputs.
-    Tries post_process_instance_segmentation first (official API),
-    then falls back to raw pred_masks interpolation.
-    """
-    # ── Official API: post_process_instance_segmentation ────────────────────
     try:
-        post = processor.post_process_instance_segmentation(
+        # Official SAM3 API — text as plain string
+        inputs = processor(images=image, text=text, return_tensors="pt")
+        inputs = inputs.to(DEVICE)
+
+        logger.info(f"[PCS] Concept='{text}' | Input keys: {list(inputs.keys())}")
+
+        with torch.inference_mode():
+            outputs = model(**inputs)
+
+        logger.info(f"[PCS] Output type: {type(outputs).__name__}")
+        if hasattr(outputs, '__dict__'):
+            logger.info(f"[PCS] Output fields: {[k for k in vars(outputs).keys() if not k.startswith('_')][:15]}")
+
+        # Post-process — official API uses original_sizes from inputs
+        orig_sizes = inputs.get("original_sizes")
+        target_sizes = orig_sizes.tolist() if orig_sizes is not None else [(h, w)]
+
+        results = processor.post_process_instance_segmentation(
             outputs,
-            threshold=threshold,
+            threshold=0.4,
             mask_threshold=0.5,
             target_sizes=target_sizes,
-        )
-        if post and post[0].get("masks") is not None and len(post[0]["masks"]) > 0:
-            masks = post[0]["masks"]
-            scores = post[0].get("scores")
-            best = int(torch.argmax(scores).item()) if (scores is not None and len(scores) > 0) else 0
-            score = float(scores[best]) if scores is not None else 0.7
-            mask = masks[best].cpu().numpy().astype(np.uint8) * 255
-            if mask.sum() > 0:
-                return mask, score
-    except Exception as e:
-        logger.debug(f"post_process_instance_segmentation: {e}")
+        )[0]
 
-    # ── Fallback: raw pred_masks upsampled ───────────────────────────────────
-    try:
-        if hasattr(outputs, "pred_masks"):
-            pm = outputs.pred_masks  # (B, N, H_low, W_low)
-            iou = getattr(outputs, "iou_scores", None)
-            m = pm[0]  # (N, H_low, W_low)
-            if m.dim() == 3:
-                up = torch.nn.functional.interpolate(
-                    m.unsqueeze(0).float(), size=(h, w), mode="bilinear", align_corners=False
-                ).squeeze(0)
-                binary = (up > 0).cpu().numpy().astype(np.uint8) * 255
-                if iou is not None:
-                    sc = np.atleast_1d(iou[0].squeeze().cpu().numpy())
-                    best = int(np.argmax(sc))
-                    score = float(sc[best])
-                else:
-                    best, score = 0, 0.7
-                if binary[best].sum() > 0:
-                    return binary[best], score
-    except Exception as e:
-        logger.debug(f"pred_masks fallback: {e}")
+        masks = results.get("masks", [])
+        scores = results.get("scores", [])
+        boxes = results.get("boxes", [])
 
-    return None, 0.0
+        logger.info(f"[PCS] '{text}' → {len(masks)} instance(s) found")
+
+        instances = []
+        for i, mask in enumerate(masks):
+            m = mask.cpu().numpy().astype(np.uint8) * 255
+            if m.sum() == 0:
+                continue
+            score = float(scores[i]) if i < len(scores) else 0.7
+            box = boxes[i].cpu().numpy().tolist() if i < len(boxes) else None
+            instances.append({"mask": m, "score": score, "box": box})
+
+        return instances
+
+    except Exception as e:
+        logger.error(f"[PCS] Failed for '{text}': {e}", exc_info=True)
+        return []
 
 
 def encode_rle(mask: np.ndarray) -> dict:
@@ -285,25 +199,48 @@ def handler(job: dict) -> dict:
     except Exception as e:
         return {"error": f"Model load failed: {e}"}
 
-    prompts = job_input.get("prompts", [])
-    if not prompts:
-        return {"error": "No prompts provided"}
+    # Support both new "concepts" format and legacy "prompts" format
+    concepts = job_input.get("concepts")
+    if not concepts:
+        # Legacy: convert prompts → concepts (group by unique text)
+        prompts = job_input.get("prompts", [])
+        if not prompts:
+            return {"error": "No concepts or prompts provided"}
+        seen = {}
+        for p in prompts:
+            t = p.get("text", "room")
+            if t not in seen:
+                seen[t] = {"type": t, "text": t}
+        concepts = list(seen.values())
 
-    try:
-        raw = segment_rooms(model, processor, image, prompts)
-    except Exception as e:
-        logger.exception("Segmentation error")
-        return {"error": f"Segmentation failed: {e}"}
+    # Run PCS for each room type concept
+    segments = []
+    for concept in concepts:
+        text = concept.get("text", concept.get("type", "room"))
+        instances = segment_concept(model, processor, image, text)
 
-    output_masks = [
-        {"id": r["id"], "mask_rle": encode_rle(r["mask"]), "score": round(r["score"], 4)}
-        for r in raw
-    ]
+        segments.append({
+            "type": concept.get("type", text),
+            "text": text,
+            "instances": [
+                {
+                    "mask_rle": encode_rle(inst["mask"]),
+                    "score": round(inst["score"], 4),
+                    "box": inst["box"],
+                }
+                for inst in instances
+            ],
+        })
 
     elapsed = round(time.time() - t0, 2)
-    logger.info(f"Done: {len(prompts)} rooms in {elapsed}s")
+    total_instances = sum(len(s["instances"]) for s in segments)
+    logger.info(f"Done: {len(concepts)} concepts → {total_instances} instances in {elapsed}s")
 
-    return {"masks": output_masks, "model_used": "sam3", "processing_time_s": elapsed}
+    return {
+        "segments": segments,
+        "model_used": "sam3",
+        "processing_time_s": elapsed,
+    }
 
 
 if __name__ == "__main__":
